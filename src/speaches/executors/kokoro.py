@@ -6,6 +6,8 @@ from typing import Literal
 
 import huggingface_hub
 from kokoro_onnx import Kokoro
+import kokoro_onnx
+kokoro_onnx.MAX_PHONEME_LENGTH = 200
 from onnxruntime import InferenceSession
 from pydantic import BaseModel, computed_field
 
@@ -194,6 +196,12 @@ class KokoroModelManager(BaseModelManager[Kokoro]):
     def _load_fn(self, model_id: str) -> Kokoro:
         model_files = kokoro_model_registry.get_model_files(model_id)
         providers = get_ort_providers_with_options(self.ort_opts)
+        # Limit CUDA VRAM: smaller arena for this small model
+        providers = [
+            (name, {**opts, "gpu_mem_limit": 4 * 1024**3, "arena_extend_strategy": "kSameAsRequested"})
+            if name == "CUDAExecutionProvider" else (name, opts)
+            for name, opts in providers
+        ]
         inf_sess = InferenceSession(model_files.model, providers=providers)
         return Kokoro.from_session(inf_sess, str(model_files.voices))
 
@@ -219,15 +227,12 @@ class KokoroModelManager(BaseModelManager[Kokoro]):
         voice_language = next(v.language for v in VOICES if v.name == request.voice)
         with self.load_model(request.model) as tts:
             start = time.perf_counter()
-            async_stream = tts.create_stream(
+            samples, sample_rate = tts.create(
                 request.text,
                 request.voice,
                 lang=voice_language,
                 speed=request.speed,
             )
-            # HACK: converting an async generator to a sync generator
-            sync_stream = async_to_sync_generator(async_stream)
-            for audio_data, _ in sync_stream:
-                yield Audio(audio_data, sample_rate=SAMPLE_RATE)
+            yield Audio(samples, sample_rate=SAMPLE_RATE)
 
         logger.info(f"Generated audio for {len(request.text)} characters in {time.perf_counter() - start}s")
